@@ -222,10 +222,11 @@ func dialPlainQUIC(
 //     headerManagerConn, GeckoConfig — обычным WrapPacketConnClient. Оба пути
 //     реализованы самим ядром, поэтому формат пакетов совпадает с сервером.
 //  2. FinalMask.DialUDP даёт уже обфусцированный PacketConn.
-//  3. quic.Transport{Conn: pktConn, DisableGSO: true}.DialEarly — GSO
-//     ОБЯЗАТЕЛЬНО выключен: пакеты переписываются после выхода из стека
-//     (salamander добавляет 8-байтный salt, gecko ещё и фрагментирует), а GSO
-//     объединяет сегменты, и переписывание повредило бы каждый из них.
+//  3. quic.Transport{Conn: pktConn, DisableGSO: true}.Dial — GSO ОБЯЗАТЕЛЬНО
+//     выключен: пакеты переписываются после выхода из стека (salamander
+//     добавляет 8-байтный salt, gecko ещё и фрагментирует), а GSO объединяет
+//     сегменты, и переписывание повредило бы каждый из них. Используется Dial,
+//     а не DialEarly: нужен ЗАВЕРШЁННЫЙ handshake, иначе сертификат пуст.
 func dialObfuscatedQUIC(
 	ctx context.Context,
 	request certSha256Request,
@@ -283,7 +284,13 @@ func dialObfuscatedQUIC(
 		DisableGSO: true,
 	}
 
-	conn, err := tr.DialEarly(dialCtx, udpAddr, tlsConfig, quicConfig)
+	// Dial, а НЕ DialEarly (важно). DialEarly возвращает соединение до
+	// завершения TLS-рукопожатия (0-RTT), и ConnectionState().TLS.PeerCertificates
+	// в этот момент ещё ПУСТ — функция вернула бы «peer certificate is empty»
+	// на полностью рабочем сервере. Ядро в hysteria/dialer.go использует
+	// DialEarly, но затем ждёт HTTP-ответ, то есть полное рукопожатие; нам же
+	// сертификат нужен сразу, поэтому ждём handshake явно.
+	conn, err := tr.Dial(dialCtx, udpAddr, tlsConfig, quicConfig)
 	if err != nil {
 		// Порядок закрытия ВАЖЕН и совпадает с transport/internet/hysteria:
 		// сначала Transport (его внутренние горутины пишут в сокет), затем сам
