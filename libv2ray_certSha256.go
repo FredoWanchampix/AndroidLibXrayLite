@@ -137,19 +137,18 @@ func fetchQUICCertSha256(request certSha256Request) (string, error) {
 }
 
 // hasObfuscation сообщает, задана ли обфускация QUIC в запросе.
-// Обфускация включена, когда есть тип (salamander/gecko) И непустой пароль:
-// без пароля salamander не работает (xray-core требует PSK >= 4 байт), а
-// «пустой» тип означает plain QUIC.
+//
+// Обфускация включена, когда тип obfs непустой и не "none", И пароль непустой
+// (без пароля salamander не работает — xray-core требует PSK >= 4 байт).
+// Неизвестный тип здесь НЕ отсекается намеренно: он доходит до buildUDPMask и
+// даёт ЯВНУЮ ошибку "unsupported obfs type", а не молчаливый plain-QUIC с
+// последующим «context deadline exceeded». Молчаливая деградация хуже честной
+// диагностики: пользователь увидел бы таймаут и не понял бы причину.
 func hasObfuscation(request certSha256Request) bool {
 	if request.ObfsPassword == "" {
 		return false
 	}
-	switch normalizeObfsType(request.Obfs) {
-	case obfsSalamander, obfsGecko:
-		return true
-	default:
-		return false
-	}
+	return normalizeObfsType(request.Obfs) != obfsNone
 }
 
 const (
