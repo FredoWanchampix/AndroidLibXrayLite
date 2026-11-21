@@ -20,7 +20,7 @@ jobs:
 
     - name: Checkout repository
       uses: actions/checkout@v6
-      
+
     - name: Setup Golang
       uses: actions/setup-go@v6
       with:
@@ -30,7 +30,7 @@ jobs:
       run: |
         go install golang.org/x/mobile/cmd/gomobile@latest
         export PATH=$PATH:~/go/bin
-        
+
     - name: Setup Android SDK
       uses: android-actions/setup-android@v4
       with:
@@ -45,6 +45,12 @@ jobs:
           --install "ndk;29.0.14206865"
         echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> $GITHUB_ENV
 
+    # ТРЕБОВАНИЕ ВЛАДЕЛЬЦА: в клиенте 5 APK — по одному на каждую из 4 ABI
+    # (arm64-v8a, armeabi-v7a, x86, x86_64) плюс universal со всеми четырьмя
+    # .so монолитно. Клиент берёт libgojni.so ИЗ ЭТОГО aar, поэтому aar обязан
+    # содержать ВСЕ ЧЕТЫРЕ ABI. gomobile bind по умолчанию собирает только
+    # arm,arm64,386,amd64 — список задаём ЯВНО, чтобы ни одна архитектура не
+    # потерялась молча.
     - name: Build
       run: |
          mkdir -p assets data
@@ -52,8 +58,88 @@ jobs:
          cp -v data/*.dat assets/
          gomobile init
          go mod tidy
-         gomobile bind -v -androidapi 24 -trimpath -ldflags='-s -w -buildid= -checklinkname=0' ./
- 
+         gomobile bind -v -androidapi 24 -trimpath \
+           -target=android/arm,android/arm64,android/386,android/amd64 \
+           -ldflags='-s -w -buildid= -checklinkname=0' ./
+
+    # ЖЁСТКИЙ ГЕЙТ: все 4 ABI обязаны лежать в aar, каждая .so — валидный ELF
+    # нужной машины. Провал здесь останавливает публикацию: лучше красный CI,
+    # чем universal-APK без одной из архитектур (на устройстве —
+    # UnsatisfiedLinkError в рантайме).
+    - name: Verify all four ABIs are present in the aar
+      shell: bash
+      run: |
+        set -euo pipefail
+        AAR="$(ls libv2ray.aar)"
+        echo "Проверяю $AAR ($(stat -c%s "$AAR") байт)"
+
+        mkdir -p /tmp/aarcheck
+        unzip -q -o "$AAR" -d /tmp/aarcheck
+
+        declare -A WANT_MACHINE=(
+          ["armeabi-v7a"]="ARM"
+          ["arm64-v8a"]="AArch64"
+          ["x86"]="Intel 80386"
+          ["x86_64"]="x86-64"
+        )
+        failed=0
+        for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+          so="/tmp/aarcheck/jni/$abi/libgojni.so"
+          if [ ! -f "$so" ]; then
+            echo "::error::ОТСУТСТВУЕТ jni/$abi/libgojni.so"
+            failed=1
+            continue
+          fi
+          size="$(stat -c%s "$so")"
+          # ELF-заголовок: e_machine на смещении 18 (2 байта, little-endian)
+          machine="$(od -An -tu2 -j18 -N2 "$so" | tr -d ' ')"
+          case "$machine" in
+            40) mname="ARM (armeabi-v7a)";;
+            183) mname="AArch64 (arm64-v8a)";;
+            3) mname="Intel 80386 (x86)";;
+            62) mname="x86-64";;
+            *) mname="НЕИЗВЕСТНАЯ ($machine)";;
+          esac
+          echo "  $abi: ${size} байт, e_machine=$machine ($mname)"
+          case "$abi" in
+            armeabi-v7a) [ "$machine" = "40" ] || { echo "::error::$abi: ожидался e_machine=40 (ARM), получено $machine"; failed=1; };;
+            arm64-v8a)   [ "$machine" = "183" ] || { echo "::error::$abi: ожидался e_machine=183 (AArch64), получено $machine"; failed=1; };;
+            x86)         [ "$machine" = "3" ] || { echo "::error::$abi: ожидался e_machine=3 (i386), получено $machine"; failed=1; };;
+            x86_64)      [ "$machine" = "62" ] || { echo "::error::$abi: ожидался e_machine=62 (x86-64), получено $machine"; failed=1; };;
+          esac
+        done
+
+        # geo-данные обязаны остаться в aar (клиент их использует)
+        for dat in geoip.dat geosite.dat geoip-only-cn-private.dat; do
+          if [ ! -f "/tmp/aarcheck/assets/$dat" ]; then
+            echo "::error::ОТСУТСТВУЕТ assets/$dat"; failed=1
+          fi
+        done
+
+        # Маркер новой функции: обфускация обязана быть в символах каждой .so,
+        # иначе aar собран из старого кода.
+        for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+          so="/tmp/aarcheck/jni/$abi/libgojni.so"
+          [ -f "$so" ] || continue
+          if ! python3 - "$so" <<'PYEOF'
+        import sys
+        marker = b"unsupported obfs type"
+        with open(sys.argv[1], "rb") as fh:
+            data = fh.read()
+        sys.exit(0 if marker in data else 1)
+        PYEOF
+          then
+            echo "::error::$abi: маркер obfs-поддержки НЕ найден в libgojni.so (собрался старый код?)"
+            failed=1
+          fi
+        done
+
+        if [ "$failed" -ne 0 ]; then
+          echo "::error::ГЕЙТ ПРОВАЛЕН: aar не содержит всех 4 ABI корректно"
+          exit 1
+        fi
+        echo "ГЕЙТ ПРОЙДЕН: все 4 ABI на месте, e_machine совпадает, geo-данные и маркер obfs присутствуют."
+
     - name: Upload build artifacts
       if: github.event.inputs.release_tag == ''
       uses: actions/upload-artifact@v7
