@@ -13,6 +13,13 @@ on:
     branches:
       - main
 
+# Права ОБЯЗАТЕЛЬНЫ: шаг публикации релиза (svenstaro/upload-release-action)
+# создаёт релиз через REST API, а дефолтный GITHUB_TOKEN с правами только на
+# чтение даёт «Not Found» при попытке создания (вещдок: прогон 2 форка упал
+# именно так — сборка и гейт 4 ABI прошли, упал только upload to release).
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
